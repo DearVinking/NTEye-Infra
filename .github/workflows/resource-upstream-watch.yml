@@ -1,0 +1,105 @@
+name: Resource Upstream Watch
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: Build even when no allowlisted upstream change is detected
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: resource-upstream-watch
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.detect.outputs.changed }}
+      next_version: ${{ steps.baseline.outputs.next_version }}
+      min_app_version: ${{ steps.baseline.outputs.baseline_min_app_version }}
+      baseline_fingerprint: ${{ steps.detect.outputs.skip_if_fingerprint }}
+    steps:
+      - name: Checkout infrastructure repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Resolve published baseline
+        id: baseline
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ./resources/scripts/resolve-baseline.sh "$GITHUB_REPOSITORY" | tee "$RUNNER_TEMP/baseline.txt"
+          grep -qE '^baseline_commit=[0-9a-f]{40}$' "$RUNNER_TEMP/baseline.txt"
+          grep -qE '^next_version=[0-9]+\.[0-9]+\.[0-9]+$' "$RUNNER_TEMP/baseline.txt"
+          cat "$RUNNER_TEMP/baseline.txt" >> "$GITHUB_OUTPUT"
+
+      - name: Detect upstream asset changes
+        id: detect
+        shell: bash
+        env:
+          BASELINE_COMMIT: ${{ steps.baseline.outputs.baseline_commit }}
+          BASELINE_FINGERPRINT: ${{ steps.baseline.outputs.baseline_fingerprint }}
+          SOURCE_REPOSITORY: https://github.com/Waifus-Grace/NTE_Assets
+          FORCE_BUILD: ${{ inputs.force_build }}
+        run: |
+          set -euo pipefail
+          ./resources/scripts/upstream-changed.sh "$BASELINE_COMMIT" "$SOURCE_REPOSITORY" \
+            > "$RUNNER_TEMP/detect.txt"
+          cat "$RUNNER_TEMP/detect.txt"
+          changed="$(sed -nE 's/^changed=(.*)$/\1/p' "$RUNNER_TEMP/detect.txt")"
+          [[ "$changed" == "true" || "$changed" == "false" ]]
+          skip_if_fingerprint="$BASELINE_FINGERPRINT"
+          if [[ "$FORCE_BUILD" == "true" ]]; then
+            skip_if_fingerprint=''
+            if [[ "$changed" != "true" ]]; then
+              changed=true
+              echo "::notice::手动强制构建，忽略上游变更检测结果"
+            fi
+          fi
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          echo "skip_if_fingerprint=$skip_if_fingerprint" >> "$GITHUB_OUTPUT"
+
+      - name: Summarize detection
+        shell: bash
+        env:
+          BASELINE_TAG: ${{ steps.baseline.outputs.baseline_tag }}
+          BASELINE_COMMIT: ${{ steps.baseline.outputs.baseline_commit }}
+          NEXT_VERSION: ${{ steps.baseline.outputs.next_version }}
+          CHANGED: ${{ steps.detect.outputs.changed }}
+        run: |
+          set -euo pipefail
+          reason="$(sed -nE 's/^reason=(.*)$/\1/p' "$RUNNER_TEMP/detect.txt")"
+          {
+            echo "### 上游变更检测"
+            echo
+            echo "| 项目 | 值 |"
+            echo "| --- | --- |"
+            echo "| 基线版本 | \`$BASELINE_TAG\` |"
+            echo "| 基线上游 commit | \`$BASELINE_COMMIT\` |"
+            echo "| 判定 | $CHANGED |"
+            echo "| 原因 | $reason |"
+            if [[ "$CHANGED" == "true" ]]; then
+              echo "| 待发布版本 | \`resources-v$NEXT_VERSION\` |"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    needs: detect
+    if: needs.detect.outputs.changed == 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/resource-release.yml
+    with:
+      version: ${{ needs.detect.outputs.next_version }}
+      min_app_version: ${{ needs.detect.outputs.min_app_version }}
+      skip_if_fingerprint: ${{ needs.detect.outputs.baseline_fingerprint }}
+    secrets: inherit

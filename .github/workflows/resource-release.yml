@@ -1,0 +1,184 @@
+name: Resource Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Game version (X.Y or X.Y.Z, e.g. 1.3 or 1.3.0)
+        required: true
+        type: string
+      min_app_version:
+        description: Minimum desktop application version
+        required: true
+        default: 1.0.0
+        type: string
+  workflow_call:
+    inputs:
+      version:
+        description: Game version (X.Y or X.Y.Z, e.g. 1.3 or 1.3.0)
+        required: true
+        type: string
+      min_app_version:
+        description: Minimum desktop application version
+        required: true
+        type: string
+      skip_if_fingerprint:
+        description: >-
+          Skip publishing when the freshly built manifest fingerprint equals this
+          value (set by the upstream watcher to the last published fingerprint).
+        required: false
+        default: ''
+        type: string
+    outputs:
+      published:
+        description: Whether a new resource release was published
+        value: ${{ jobs.build.outputs.published }}
+      version:
+        description: Normalized resource version that was built
+        value: ${{ jobs.build.outputs.version }}
+      fingerprint:
+        description: Content fingerprint of the freshly built manifest
+        value: ${{ jobs.build.outputs.fingerprint }}
+
+permissions:
+  contents: read
+
+env:
+  RESOURCE_REPOSITORY: https://github.com/DearVinking/NTEye-Infra
+  SOURCE_REPOSITORY: https://github.com/Waifus-Grace/NTE_Assets
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      published: ${{ steps.publish.outputs.published == 'true' }}
+      version: ${{ steps.fingerprint.outputs.version }}
+      fingerprint: ${{ steps.fingerprint.outputs.fingerprint }}
+    steps:
+      - name: Checkout infrastructure repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Read builder lock
+        id: lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          builder_repo="$(jq -r .builder_repository resources/builder.lock)"
+          builder_commit="$(jq -r .builder_commit resources/builder.lock)"
+          [[ "$builder_commit" =~ ^[0-9a-fA-F]{40}$ ]]
+          [[ "$builder_commit" != "0000000000000000000000000000000000000000" ]]
+          echo "repository=$builder_repo" >> "$GITHUB_OUTPUT"
+          echo "commit=$builder_commit" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout pinned builder
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: ${{ steps.lock.outputs.repository }}
+          ref: ${{ steps.lock.outputs.commit }}
+          path: builder
+          token: ${{ secrets.CI_TOKEN }}
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: nightly-2026-07-12
+
+      - name: Materialize allowlisted upstream files
+        shell: bash
+        run: ./resources/scripts/materialize-assets.sh nte-assets-src "$SOURCE_REPOSITORY"
+
+      - name: Normalize game version
+        shell: bash
+        env:
+          GAME_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$GAME_VERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]
+          if [[ "$GAME_VERSION" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            GAME_VERSION="${GAME_VERSION}.0"
+          fi
+          echo "RESOURCE_VERSION=$GAME_VERSION" >> "$GITHUB_ENV"
+
+      - name: Build map and resource package
+        shell: bash
+        env:
+          MIN_APP_VERSION: ${{ inputs.min_app_version }}
+        run: |
+          set -euo pipefail
+          [[ "$RESOURCE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          source_commit="$(cat nte-assets-src/source-commit.txt)"
+          mkdir -p maps dist
+          cargo run --manifest-path builder/tools/xtask/Cargo.toml -- maps build \
+            --assets-root nte-assets-src/source --out-dir maps
+          release_tag="resources-v${RESOURCE_VERSION}"
+          cargo run --manifest-path builder/tools/xtask/Cargo.toml -- resources build \
+            --maps-dir maps \
+            --out "dist/nteye-resources-${RESOURCE_VERSION}.zip" \
+            --manifest-out "dist/nteye-resources.json" \
+            --version "$RESOURCE_VERSION" \
+            --source-repo "$SOURCE_REPOSITORY" \
+            --source-commit "$source_commit" \
+            --min-app-version "$MIN_APP_VERSION" \
+            --release-url "$RESOURCE_REPOSITORY/releases/tag/$release_tag" \
+            --download-url "$RESOURCE_REPOSITORY/releases/download/$release_tag/nteye-resources-${RESOURCE_VERSION}.zip"
+
+      - name: Compare content fingerprint
+        id: fingerprint
+        shell: bash
+        env:
+          SKIP_IF_FINGERPRINT: ${{ inputs.skip_if_fingerprint }}
+        run: |
+          set -euo pipefail
+          fingerprint="$(./resources/scripts/manifest-fingerprint.sh dist/nteye-resources.json)"
+          echo "version=$RESOURCE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+          echo "built fingerprint: $fingerprint"
+          if [[ -n "$SKIP_IF_FINGERPRINT" && "$SKIP_IF_FINGERPRINT" == "$fingerprint" ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::生成的 map 内容与已发布版本相同（指纹 $fingerprint），跳过发布"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Sign resource package
+        if: steps.fingerprint.outputs.skip != 'true'
+        shell: bash
+        env:
+          NTEYE_RESOURCE_MINISIGN_SECRET_KEY_B64: ${{ secrets.NTEYE_RESOURCE_MINISIGN_SECRET_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          [[ -n "$NTEYE_RESOURCE_MINISIGN_SECRET_KEY_B64" ]]
+          printf '%s' "$NTEYE_RESOURCE_MINISIGN_SECRET_KEY_B64" | base64 --decode > "$RUNNER_TEMP/nteye-resources.key"
+          chmod 600 "$RUNNER_TEMP/nteye-resources.key"
+          trap 'rm -f "$RUNNER_TEMP/nteye-resources.key"' EXIT
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends minisign
+          minisign -S -s "$RUNNER_TEMP/nteye-resources.key" -m "dist/nteye-resources-${RESOURCE_VERSION}.zip" -x "dist/nteye-resources-${RESOURCE_VERSION}.zip.minisig"
+          minisign -Vm "dist/nteye-resources-${RESOURCE_VERSION}.zip" -x "dist/nteye-resources-${RESOURCE_VERSION}.zip.minisig" -p builder/crates/nteye-update/keys/nteye-resources.pub
+
+      - name: Publish immutable resource release
+        id: publish
+        if: steps.fingerprint.outputs.skip != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="resources-v${RESOURCE_VERSION}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "resource release already exists: $tag" >&2
+            exit 1
+          fi
+          git tag "$tag"
+          git push origin "$tag"
+          gh release create "$tag" \
+            "dist/nteye-resources-${RESOURCE_VERSION}.zip" \
+            "dist/nteye-resources-${RESOURCE_VERSION}.zip.minisig" \
+            "dist/nteye-resources.json" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$tag" \
+            --notes "Immutable NTEye runtime resource snapshot for game ${RESOURCE_VERSION}" \
+            --verify-tag
+          echo "published=true" >> "$GITHUB_OUTPUT"

@@ -1,0 +1,7 @@
+{
+  "builder_repository": "DearVinking/NTEye",
+  "builder_commit": "5026e8b820b5f7ffda9954aead3db2f5e8d7b504",
+  "builder_command": "cargo xtask resources build",
+  "resource_schema": "nteye-resources@2",
+  "maps_schema_version": 4
+}
