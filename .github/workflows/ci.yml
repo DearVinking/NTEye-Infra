@@ -247,7 +247,7 @@ jobs:
         run: >-
           gh api -X POST "repos/DearVinking/NTEye/statuses/${{ github.event.inputs.sha }}"
           -f state="$STATE"
-          -f context="ci/${{ github.job }}"
+          -f context="ci/${{ github.job }}-${{ matrix.sanitizer }}"
           -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
   macos-main-thread-checker:
