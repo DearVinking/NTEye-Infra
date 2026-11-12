@@ -4,6 +4,7 @@ set -euo pipefail
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo="${1:?owner/repo is required}"
 manifest_out="${2:-}"
+upstream_version="${3:-}"
 
 tag_pattern='^resources-v([0-9]+)\.([0-9]+)\.([0-9]+)$'
 
@@ -60,34 +61,18 @@ mapfile -t existing_tags < <(
   git ls-remote --tags "https://github.com/${repo}.git" \
     | sed -nE "s#^.*refs/tags/(resources-v[0-9]+\.[0-9]+\.[0-9]+)\$#\1#p"
 )
-tag_taken() {
-  local candidate="$1" existing
-  for existing in "${existing_tags[@]}"; do
-    [[ "$existing" == "$candidate" ]] && return 0
-  done
-  return 1
+selection="$(printf '%s\n' "${existing_tags[@]}" \
+  | bash "$script_dir/select-version.sh" "$baseline_version" "$upstream_version")"
+next_version="$(sed -nE 's/^next_version=(.*)$/\1/p' <<<"$selection")"
+version_source="$(sed -nE 's/^version_source=(.*)$/\1/p' <<<"$selection")"
+[[ "$next_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+  echo "could not select an unused version: $next_version" >&2
+  exit 1
 }
-
-next_major="" next_minor="" next_patch=""
-for tag in "${existing_tags[@]}" "$baseline_tag"; do
-  version="${tag#resources-v}"
-  IFS=. read -r major minor patch <<<"$version"
-  key="$(version_sort_key "$version")"
-  if [[ -z "$next_major" || "$key" > "$(version_sort_key "${next_major}.${next_minor}.${next_patch}")" ]]; then
-    next_major="$major" next_minor="$minor" next_patch="$patch"
-  fi
-done
-
-next_version=""
-for _ in $(seq 1 100); do
-  next_patch=$((next_patch + 1))
-  candidate="${next_major}.${next_minor}.${next_patch}"
-  if ! tag_taken "resources-v${candidate}"; then
-    next_version="$candidate"
-    break
-  fi
-done
-[[ -n "$next_version" ]] || { echo "could not find an unused patch version" >&2; exit 1; }
+[[ "$version_source" =~ ^(upstream|patch)$ ]] || {
+  echo "could not determine version source: $version_source" >&2
+  exit 1
+}
 
 echo "baseline_tag=$baseline_tag"
 echo "baseline_version=$baseline_version"
@@ -95,3 +80,4 @@ echo "baseline_commit=$baseline_commit"
 echo "baseline_min_app_version=$baseline_min_app_version"
 echo "baseline_fingerprint=$(bash "$script_dir/manifest-fingerprint.sh" "$manifest")"
 echo "next_version=$next_version"
+echo "version_source=$version_source"

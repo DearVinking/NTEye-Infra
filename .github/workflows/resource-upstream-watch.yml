@@ -30,16 +30,30 @@ jobs:
       - name: Checkout infrastructure repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
+      - name: Resolve upstream commit version
+        id: upstream
+        shell: bash
+        env:
+          SOURCE_REPOSITORY: https://github.com/Waifus-Grace/NTE_Assets
+        run: |
+          set -euo pipefail
+          ./resources/scripts/upstream-version.sh "$SOURCE_REPOSITORY" > "$RUNNER_TEMP/upstream.txt"
+          cat "$RUNNER_TEMP/upstream.txt"
+          grep -qE '^upstream_version=([0-9]+\.[0-9]+\.[0-9]+)?$' "$RUNNER_TEMP/upstream.txt"
+          cat "$RUNNER_TEMP/upstream.txt" >> "$GITHUB_OUTPUT"
+
       - name: Resolve published baseline
         id: baseline
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          UPSTREAM_VERSION: ${{ steps.upstream.outputs.upstream_version }}
         run: |
           set -euo pipefail
-          ./resources/scripts/resolve-baseline.sh "$GITHUB_REPOSITORY" | tee "$RUNNER_TEMP/baseline.txt"
+          ./resources/scripts/resolve-baseline.sh "$GITHUB_REPOSITORY" "" "$UPSTREAM_VERSION" | tee "$RUNNER_TEMP/baseline.txt"
           grep -qE '^baseline_commit=[0-9a-f]{40}$' "$RUNNER_TEMP/baseline.txt"
           grep -qE '^next_version=[0-9]+\.[0-9]+\.[0-9]+$' "$RUNNER_TEMP/baseline.txt"
+          grep -qE '^version_source=(upstream|patch)$' "$RUNNER_TEMP/baseline.txt"
           cat "$RUNNER_TEMP/baseline.txt" >> "$GITHUB_OUTPUT"
 
       - name: Detect upstream asset changes
@@ -74,10 +88,22 @@ jobs:
           BASELINE_TAG: ${{ steps.baseline.outputs.baseline_tag }}
           BASELINE_COMMIT: ${{ steps.baseline.outputs.baseline_commit }}
           NEXT_VERSION: ${{ steps.baseline.outputs.next_version }}
+          VERSION_SOURCE: ${{ steps.baseline.outputs.version_source }}
+          UPSTREAM_VERSION: ${{ steps.upstream.outputs.upstream_version }}
+          UPSTREAM_VERSION_COMMIT: ${{ steps.upstream.outputs.upstream_version_commit }}
           CHANGED: ${{ steps.detect.outputs.changed }}
         run: |
           set -euo pipefail
           reason="$(sed -nE 's/^reason=(.*)$/\1/p' "$RUNNER_TEMP/detect.txt")"
+          upstream_display="${UPSTREAM_VERSION:-未解析}"
+          if [[ -n "$UPSTREAM_VERSION" && -n "$UPSTREAM_VERSION_COMMIT" ]]; then
+            upstream_display="$UPSTREAM_VERSION (${UPSTREAM_VERSION_COMMIT:0:10})"
+          fi
+          case "$VERSION_SOURCE" in
+            upstream) version_source_display='upstream（X.Y 跟随上游）' ;;
+            patch) version_source_display='patch（同版本线内自增）' ;;
+            *) version_source_display="$VERSION_SOURCE" ;;
+          esac
           {
             echo "### 上游变更检测"
             echo
@@ -85,10 +111,12 @@ jobs:
             echo "| --- | --- |"
             echo "| 基线版本 | \`$BASELINE_TAG\` |"
             echo "| 基线上游 commit | \`$BASELINE_COMMIT\` |"
+            echo "| 上游解析版本 | \`$upstream_display\` |"
             echo "| 判定 | $CHANGED |"
             echo "| 原因 | $reason |"
             if [[ "$CHANGED" == "true" ]]; then
               echo "| 待发布版本 | \`resources-v$NEXT_VERSION\` |"
+              echo "| 版本来源 | $version_source_display |"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
